@@ -1,0 +1,200 @@
+%tensorflow_version 2.x
+from __future__ import absolute_import, division, print_function, unicode_literals
+import tensorflow as tf
+
+!pip install -q imageio
+
+import glob
+import imageio
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import numpy as np
+import os
+import PIL
+from tensorflow.keras import layers
+import time
+from IPython import display
+
+from google.colab import drive
+
+drive.mount('/content/gdrive')
+img_path = 'gdrive/My Drive/Colab Notebooks/Images/image dataset/kushan_images/Vasiliy_Kandinskiy/'
+
+from PIL import Image
+
+dataset = []
+DATA_SIZE = 88
+AMPLIFICATION = 10
+for i in range(1, DATA_SIZE):
+  for j in range(AMPLIFICATION):
+    image = Image.open(img_path + 'Vasiliy_Kandinskiy_{}.jpg'.format(i))
+    dataset.append((np.asarray(image)-127.5)/127.5)
+    
+BATCH_SIZE = 8
+BUFFER_SIZE = 60000
+train_dataset = tf.data.Dataset.from_tensor_slices(dataset).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+#generator
+
+def make_generator_model():
+    model = tf.keras.Sequential()
+    model.add(layers.Dense(32*32*1024, use_bias=False, input_shape=(100,)))
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+    
+    model.add(layers.Reshape((32, 32, 1024)))
+    assert model.output_shape == (None, 32, 32, 1024) 
+    
+    model.add(layers.Conv2DTranspose(512, (3,3), strides=(2,2), padding='same', use_bias=False))
+    assert model.output_shape == (None, 64, 64, 512)
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+    
+    model.add(layers.Conv2DTranspose(256, (3,3), strides=(2,2), padding='same', use_bias=False ))
+    assert model.output_shape == (None, 128, 128, 256)
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+    
+    model.add(layers.Conv2DTranspose(128, (3,3), strides=(2,2), padding='same', use_bias=False ))
+    assert model.output_shape == (None, 256, 256, 128)
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+
+    model.add(layers.Conv2DTranspose(64, (3,3), strides=(2,2), padding='same', use_bias=False ))
+    assert model.output_shape == (None, 512, 512, 64)
+    model.add(layers.BatchNormalization())
+    model.add(layers.LeakyReLU())
+    
+    model.add(layers.Conv2DTranspose(3, (3,3), strides=(1,1), padding='same', use_bias=False ))
+    assert model.output_shape == (None, 512, 512,3)
+    
+    return model
+
+gen = make_generator_model()
+
+#discriminator
+
+def make_discriminator_model():
+    model = tf.keras.Sequential()
+    model.add(layers.Conv2D(64, (3, 3), strides=(2, 2), padding='same',
+                                     input_shape=[512, 512, 3]))
+    model.add(layers.LeakyReLU())
+    model.add(layers.Dropout(0.3))
+
+    model.add(layers.Conv2D(128, (3, 3), strides=(2, 2), padding='same'))
+    model.add(layers.LeakyReLU())
+    model.add(layers.Dropout(0.3))
+
+    model.add(layers.Conv2D(256, (3, 3), strides=(2, 2), padding='same'))
+    model.add(layers.LeakyReLU())
+    model.add(layers.Dropout(0.3))
+
+    model.add(layers.Conv2D(512, (3, 3), strides=(2, 2), padding='same'))
+    model.add(layers.LeakyReLU())
+    model.add(layers.Dropout(0.3))
+
+    model.add(layers.Flatten())
+    model.add(layers.Dense(64))
+    model.add(layers.Dense(1))
+
+    return model
+
+dscrm = make_discriminator_model()
+
+#define loss
+cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+#discriminator_loss
+def discriminator_loss(real_output, fake_output):
+    real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+    fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
+    total_loss = real_loss + fake_loss
+    return total_loss
+
+#generator_loss
+
+def generator_loss(fake_output):
+    return cross_entropy(tf.ones_like(fake_output), fake_output)
+    
+#define optimizers
+
+generator_optimizer = tf.keras.optimizers.Adam(1e-4)
+discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)
+
+#save checkpoints
+
+checkpoint_dir = 'gdrive/My Drive/Colab Notebooks/Images/training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
+                                 discriminator_optimizer=discriminator_optimizer,
+                                 generator=gen,
+                                 discriminator=dscrm)
+                                 
+#training loop
+
+EPOCHS = 500
+noise_dim = 100
+num_examples_to_generate = 4
+
+#seed to reuse
+seed = tf.random.normal([num_examples_to_generate, noise_dim])
+
+
+@tf.function
+def train_step(images):
+    noise = tf.random.normal([BATCH_SIZE, noise_dim])
+    
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+        
+        generated_images = gen(noise, training=True)
+        real_output = dscrm(images, training=True)
+        fake_output = dscrm(generated_images, training=True)
+        
+        gen_loss = generator_loss(fake_output)
+        disc_loss = discriminator_loss(real_output, fake_output)
+        
+    gradients_of_generator = gen_tape.gradient(gen_loss, gen.trainable_variables)
+    gradients_of_discriminator = disc_tape.gradient(disc_loss, dscrm.trainable_variables)
+    
+    generator_optimizer.apply_gradients(zip(gradients_of_generator, gen.trainable_variables))
+    discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, dscrm.trainable_variables))
+
+def generate_and_save_img(model, epoch, test_input):
+    predictions = model(test_input, training=False)
+    
+    fig = plt.figure(figsize=(8,8))
+    
+    for i in range(predictions.shape[0]):
+        plt.subplot(4, 4, i+1)
+
+        #for j in (predictions[i,:,:,:]*127.5 + 127.5):
+          #for k in j:
+            #for l in k:
+              #l = int(l)
+        plt.imshow(np.array((predictions[i, :, :, :]*127.5 + 127.5),np.int32))
+        plt.axis('off')
+        
+    plt.savefig('image_at_epoch_{:04d}.png'.format(epoch))
+    plt.show()
+    
+def train(dataset, epochs):
+    for epoch in range(epochs):
+        start = time.time()
+        
+        for image_batch in dataset:
+            train_step(image_batch)
+            
+        #produce image
+        display.clear_output(wait=True)
+        generate_and_save_img(gen, epoch + 1, seed)
+        
+        #save model
+        if (epoch + 1)%5 == 0:
+            gen.save(checkpoint_dir)
+            
+        print('Time for epoch {} is {} sec'.format(epoch + 1, time.time()-start))
+        
+    display.clear_output(wait=True)
+    generate_and_save_img(gen, epochs, seed)
+    
+train(train_dataset, EPOCHS)
